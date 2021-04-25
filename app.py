@@ -16,28 +16,72 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 from bs4 import BeautifulSoup
 import pytz
+from urllib.parse import urljoin
 from googlemaps import Client as GoogleMaps
 gmaps = GoogleMaps(os.getenv('GMAPS_API'))
 
+hyd_hospitals = pd.read_excel("https://coronacheck.blob.core.windows.net/$web/Hyderabad%20Hospitals.xlsx", engine="openpyxl")
+hyd_hospitals.drop(['Hospital_Type','CONTACT'],axis=1, inplace=True)
+vad_hospitals = pd.read_excel("https://coronacheck.blob.core.windows.net/$web/Vadodara%20Hospitals.xlsx", engine='openpyxl')
 
-beds_status = pd.read_excel("https://coronacheck.blob.core.windows.net/$web/Vadodara%20Hospitals%20Complete.xlsx", engine='openpyxl')
-hospitals = pd.read_excel("https://coronacheck.blob.core.windows.net/$web/Vadodara%20Hospitals.xlsx", engine='openpyxl')
 
-beds_status['Vacant-ICU'] = pd.to_numeric(beds_status['Vacant-ICU'])
-beds_status['Vacant-O2'] = pd.to_numeric(beds_status['Vacant-O2'])
-beds_status['Vacant-GEN'] = pd.to_numeric(beds_status['Vacant-GEN'])
+base_URL = "http://164.100.112.24/SpringMVC/"
 
-tz_IN = pytz.timezone('Asia/Kolkata') 
-datetime_IN = datetime.now(tz_IN)
-last_updated = datetime_IN.strftime("%d %b %I:%M %p")
+p_page = requests.post(
+    urljoin(base_URL, "getHospital_Beds_Status_Citizen.htm"),
+    data={"hospital": "P"},
+    stream=True,
+)
+g_page = requests.post(
+    urljoin(base_URL, "getHospital_Beds_Status_Citizen.htm"),
+    data={"hospital": "G"},
+    stream=True,
+)
 
-# You need to set MongoDB connection strings as environment variables before proceeding
-client = MongoClient(os.getenv("MONGOURL"))
-db = client.corona    #Select the database
-db.authenticate(name=os.getenv("MONGO_USERNAME"),password=os.getenv("MONGO_PASSWORD"))
-user_request = db.hospital_request
 
-## Helper functions
+def clean_hospital(hospital_name):
+    return "".join(hospital_name.split(".")[1:]).strip()
+
+def get_hyd_data(page):
+    soup = BeautifulSoup(page.text, 'html.parser')
+    tables = soup.find_all("table")
+    column_head = ['DISTRICT','HOSPITAL','CONTACT','Total-GEN','Occupied-GEN','Vacant-GEN','Total-O2','Occupied-O2','Vacant-O2','Total-ICU','Occupied-ICU','Vacant-ICU','Total-TOTAL','Occupied-TOTAL','Vacant-TOTAL','LAST DATE','LAST TIME','LOL']
+    final_head = column_head[:-1]
+    table = tables[0]
+    tab_data = [[cell.text.strip() for cell in row.find_all(["th","td"])]
+                            for row in table.find_all("tr")]
+    df = pd.DataFrame(tab_data, columns=column_head)
+    district = ""
+    data_list = []
+    for idx,row in df.iterrows():
+        if '.' not in row['DISTRICT']:
+            district = row['HOSPITAL']
+            temp = [district]
+            temp.extend(row.values[2:])
+            data_list.append(temp)
+        else:
+            temp = [district]
+            temp.extend(row.values[:-2])
+            data_list.append(temp)
+            
+    df = pd.DataFrame(data_list, columns=final_head)
+    df['HOSPITAL'] = df['HOSPITAL'].apply(lambda x: clean_hospital(x))
+    return df[3:]
+
+
+private_hospital = get_hyd_data(p_page)
+# Adding hospital type private/government
+private_hospital = private_hospital.assign(Hospital_Type="Private")
+government_hosptal = get_hyd_data(g_page)
+government_hosptal = government_hosptal.assign(Hospital_Type="Government")
+## Combining both
+all_hospitals = pd.concat([private_hospital, government_hosptal])
+
+hyd_final = all_hospitals.merge(hyd_hospitals,how="left", on=['DISTRICT', 'HOSPITAL'])
+hyd_final.drop(['Total-GEN', 'Occupied-GEN','Total-O2', 'Occupied-O2','Total-ICU','Occupied-ICU','Total-TOTAL', 'Occupied-TOTAL', 'Vacant-TOTAL'], axis=1, inplace=True)
+## removing summary rows
+hyd_final = hyd_final[hyd_final['HOSPITAL'].str.len() > 0]
+
 def get_full_data(url):
     page = requests.get(url)
     soup = BeautifulSoup(page.text, 'html.parser')
@@ -65,68 +109,38 @@ def get_table_by_url(url, url_type):
         result = result.append(temp[1:])
     return result
 
-def add_google_data(df):
-    gmaps = GoogleMaps(os.getenv('GMAPS_API'))
-    df['Lookup'] =  df['Hospital Name'] + ", " + df['Hospital Address']
-    df['Lat'] = ""
-    df['Lon'] = ""
-    df['Place ID'] = ""
-    df['Map Link'] = ""
-    df['Contact'] = ""
-    for idx, row in df.iterrows():
-        try:
-            geocode_result = gmaps.geocode(row['Lookup'])
-            df['Lat'][idx] = geocode_result[0]['geometry']['location']['lat']
-            df['Lon'][idx] = geocode_result[0]['geometry']['location']['lng']
-            df['Place ID'][idx] = geocode_result[0]['place_id']
-            df['Map Link'][idx] = "https://www.google.com/maps/search/?api=1&query="+row['Hospital Name'].replace(" ","+")+"&query_place_id="+geocode_result[0]['place_id']
-            query = "https://maps.googleapis.com/maps/api/place/details/json?place_id="+geocode_result[0]['place_id']+"&fields=formatted_phone_number&key=AIzaSyA6rztAURUGFVYTPZLYHw_oU8uXILDRhhc"
-            r = requests.get(query)
-            if 'formatted_phone_number' in r.json()['result'].keys(): 
-                df['Contact'][idx] = r.json()['result']['formatted_phone_number']
-        except:
-            pass
-    return df
+o2 = get_table_by_url("https://vmc.gov.in/Covid19VadodaraApp/HospitalBedsDetails.aspx?tid=43","O2")
+icu = get_table_by_url("https://vmc.gov.in/Covid19VadodaraApp/HospitalBedsDetails.aspx?tid=63","ICU")
+gen = get_table_by_url("https://vmc.gov.in/Covid19VadodaraApp/HospitalBedsDetails.aspx?tid=53","GEN")
 
-## Data updation
-def update_data():
-	global hospitals
-	global beds_status
-	global last_updated
-	o2 = get_table_by_url("https://vmc.gov.in/Covid19VadodaraApp/HospitalBedsDetails.aspx?tid=43","O2")
-	icu = get_table_by_url("https://vmc.gov.in/Covid19VadodaraApp/HospitalBedsDetails.aspx?tid=63","ICU")
-	gen = get_table_by_url("https://vmc.gov.in/Covid19VadodaraApp/HospitalBedsDetails.aspx?tid=53","GEN")
-	all_hospitals = get_full_data("https://vmc.gov.in/Covid19VadodaraApp/HospitalBedsDetails.aspx?tid=13")
-	merged = icu.merge(o2, how='outer', left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'])
-	merged = merged.merge(gen, how="outer", left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'])
-	beds = merged.merge(hospitals, how='left', left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'])
+merged = icu.merge(o2, how='outer', left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'])
+merged = merged.merge(gen, how="outer", left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'])
+vad_final = merged.merge(vad_hospitals, how='left', left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'])
 
-	if sum([False if h in hospitals['Hospital Name'].values else True for h in beds['Hospital Name']])>0:
-		print("Adding new hospitals data")
-		new_hospitals = beds[[False if h in hospitals['Hospital Name'].values else True for h in beds['Hospital Name']]]
-		new_hospitals = new_hospitals[['Hospital Name','Hospital Address']].merge(all_hospitals, how='left', left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'] )
-		new_hospitals = add_google_data(new_hospitals)
-		hospitals = hospitals.append(new_hospitals)
-		beds = merged.merge(hospitals, how='left', left_on=['Hospital Name','Hospital Address'], right_on=['Hospital Name','Hospital Address'])
-		hospitals.to_excel("Vadodara Hospitals.xlsx",engine='openpyxl',index=False)
-		beds.to_excel("Vadodara Hospitals Complete.xlsx", engine='openpyxl', index=False)
-	beds_status = beds.copy()
-	beds_status['Vacant-ICU'] = pd.to_numeric(beds_status['Vacant-ICU'])
-	beds_status['Vacant-O2'] = pd.to_numeric(beds_status['Vacant-O2'])
-	beds_status['Vacant-GEN'] = pd.to_numeric(beds_status['Vacant-GEN'])
-	datetime_IN = datetime.now(tz_IN)
-	last_updated = datetime_IN.strftime("%d %b %I:%M %p")
+hyd_dict = hyd_final.to_dict('records')
+vad_dict = vad_final.to_dict('records')
+all_dict = hyd_dict + vad_dict
+final_df = pd.DataFrame(all_dict)
 
+for idx, row in final_df.iterrows():
+    if pd.isnull(row['Hospital Name']):
+        final_df.loc[idx,'Hospital Name'] = str(row['HOSPITAL']) + " - " + str(row['DISTRICT'])
+        
+final_df.drop(['DISTRICT','HOSPITAL'], axis=1, inplace=True)
 
-def print_status():
-	global beds_status
-	print(beds_status['Vacant-ICU'].sum(), beds_status['Vacant-O2'].sum(), beds_status['Vacant-GEN'].sum()) 
+final_df['Vacant-ICU'] = pd.to_numeric(final_df['Vacant-ICU'])
+final_df['Vacant-O2'] = pd.to_numeric(final_df['Vacant-O2'])
+final_df['Vacant-GEN'] = pd.to_numeric(final_df['Vacant-GEN'])
 
-## Scheduler
-sched = BackgroundScheduler(daemon=True)
-sched.start()
-sched.add_job(update_data,'interval',minutes=5, next_run_time=datetime.now())
+# Last Update logging
+tz_IN = pytz.timezone('Asia/Kolkata') 
+datetime_IN = datetime.now(tz_IN)
+last_updated = datetime_IN.strftime("%d %b %I:%M %p")
 
+def get_distance(lat1, lon1, lat2, lon2):
+    p = pi/180
+    a = 0.5 - cos((lat2-lat1)*p)/2 + cos(lat1*p) * cos(lat2*p) * (1-cos((lon2-lon1)*p))/2
+    return round(12742 * asin(sqrt(a)),2) #2*R*asin...
 
 ## App instantiation and cross origin requests setup
 app = Flask(__name__)
@@ -136,12 +150,6 @@ CORS(app)
 sender_address = os.getenv("GMAIL_SRC")
 sender_pass = os.getenv("GMAIL_PASS")
 receiver_address = os.getenv("GMAIL_DEST")
-
-
-def get_distance(lat1, lon1, lat2, lon2):
-    p = pi/180
-    a = 0.5 - cos((lat2-lat1)*p)/2 + cos(lat1*p) * cos(lat2*p) * (1-cos((lon2-lon1)*p))/2
-    return round(12742 * asin(sqrt(a)),2) #2*R*asin...
 
 ## Home
 @app.route("/")
@@ -156,28 +164,37 @@ def hello():
 def predict():
 	req_json = flask.request.json
 	print('Request JSON', req_json)
-
+	q_lat = float(req_json['lat'])
+	q_lon = float(req_json['lon'])
 	hospital_type = req_json['type']
+	# if hospital_type == "ICU":
+	# 	result = final_df[final_df['Vacant-ICU']>0]
+	# elif hospital_type == "O2":
+	# 	result = final_df[final_df['Vacant-O2']>0]
+	# elif hospital_type == "GEN":
+	# 	result = final_df[final_df['Vacant-GEN']>0]
+
+	final_df['Distance'] = final_df.apply(lambda x: get_distance(x.Lat, x.Lon,q_lat,q_lon), axis=1)
+	if sum(final_df['Distance']<20) > 10:
+		dist_filtered = final_df[final_df['Distance']<20]
+	else:
+		dist_filtered = final_df.copy()
+	print(dist_filtered.shape)
+	# dist_filtered['Vacant-ICU'] = pd.to_numeric(dist_filtered['Vacant-ICU'])
+	# dist_filtered['Vacant-O2'] = pd.to_numeric(dist_filtered['Vacant-O2'])
+	# dist_filtered['Vacant-GEN'] = pd.to_numeric(dist_filtered['Vacant-GEN'])
+	
 	if hospital_type == "ICU":
-		result = beds_status[beds_status['Vacant-ICU']>0]
+		dist_filtered = dist_filtered.sort_values(['Vacant-ICU'],ascending=False)
 	elif hospital_type == "O2":
-		result = beds_status[beds_status['Vacant-O2']>0]
+		dist_filtered = dist_filtered.sort_values(['Vacant-O2'],ascending=False)
 	elif hospital_type == "GEN":
-		result = beds_status[beds_status['Vacant-GEN']>0]
+		dist_filtered = dist_filtered.sort_values(['Vacant-GEN'],ascending=False)
 
-	result.assign(Distance = 100)
-	
-	for idx,row in result.iterrows():
-		result.loc[idx,'Distance'] = get_distance(row['Lat'],row['Lon'],float(req_json['lat']),float(req_json['lon']))
-	
-	json_str = result.sort_values(['Distance'])[:10].to_json(orient='records')
-	total_available = {
-		"Total ICU available": beds_status['Vacant-ICU'].sum(),
-		"Total O2 available": beds_status['Vacant-O2'].sum(),
-		"Total GEN available": beds_status['Vacant-GEN'].sum()
-	}
+	json_str = dist_filtered.iloc[:15].to_json(orient='records')
 
-	response = {"success": True, "result":json.loads(json_str), "last_updated":last_updated, "availability status":total_available}
+
+	response = {"success": True, "result":json.loads(json_str), "last_updated":last_updated}
 	# Log request
 	try:
 		user_request.insert_one(req_json)
